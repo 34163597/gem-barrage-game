@@ -1,5 +1,5 @@
 const canvas = document.querySelector("#game");
-const ctx = canvas.getContext("2d");
+const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
 const platform = globalThis.GamePlatform;
 const scoreEl = document.querySelector("#score");
 const chainEl = document.querySelector("#chain");
@@ -42,6 +42,8 @@ let score = 0, chain = 1, bestChain = 1, turn = 1, shake = 0;
 let running = false, aiming = true, dragging = false;
 let angle = -Math.PI / 2, launchX = 0, launchY = 0;
 let balls = [], blocks = [], particles = [], popups = [], banners = [], trails = [], snowflakes = [], shockwaves = [], beams = [];
+let aimGuideCache = null;
+let blockSpatialIndex = new Map();
 let corridorDepth = 0;
 let audioCtx, masterGain, lastHitSound = 0;
 let dropping = false, openingDrop = false;
@@ -61,6 +63,14 @@ let defenseFlash = 0;
 let defenseBlast = null;
 let adAimBoost = false;
 let watchingAd = false;
+
+const isMobile = globalThis.matchMedia?.("(pointer: coarse)")?.matches || Math.min(screen.width, screen.height) < 720;
+const renderQuality = isMobile ? "mobile" : "desktop";
+const maxParticles = isMobile ? 180 : 420;
+const maxTrails = isMobile ? 120 : 260;
+const targetRenderInterval = isMobile ? 1000 / 45 : 0;
+let lastRender = 0;
+const spatialCellSize = 92;
 
 const GOLDEN_SHOT_REWARD = 3;
 const DEFENSE_GROWTH = 1.3;
@@ -175,7 +185,9 @@ function playSound(name, strength = 1) {
 }
 
 function resize() {
-  dpr = Math.min(devicePixelRatio || 1, 2);
+  // High-density phones pay heavily for full 2x canvas redraws. Keep the game crisp
+  // while leaving enough headroom for collisions and effects during dense turns.
+  dpr = Math.min(devicePixelRatio || 1, isMobile ? 1.25 : 2);
   w = canvas.clientWidth;
   h = canvas.clientHeight;
   canvas.width = w * dpr;
@@ -187,7 +199,9 @@ function resize() {
 }
 
 function seedSnow() {
-  const count = Math.max(55, Math.floor(w * h / 6400));
+  const count = isMobile
+    ? Math.min(42, Math.max(24, Math.floor(w * h / 11800)))
+    : Math.max(55, Math.floor(w * h / 6400));
   snowflakes = Array.from({ length: count }, () => makeSnowflake(random(0, h)));
 }
 
@@ -211,6 +225,46 @@ function blockRadius(block) {
 
 function blockLayoutRadius(block) {
   return blockRadius(block) + (block.type === "triangle" ? 4 : 3);
+}
+
+function spatialCellKey(x, y) {
+  return `${Math.floor(x / spatialCellSize)}:${Math.floor(y / spatialCellSize)}`;
+}
+
+function rebuildBlockSpatialIndex() {
+  const next = new Map();
+  for (const block of blocks) {
+    if (block.value <= 0) continue;
+    const radius = blockLayoutRadius(block) + 4;
+    const minX = Math.floor((block.x - radius) / spatialCellSize);
+    const maxX = Math.floor((block.x + radius) / spatialCellSize);
+    const minY = Math.floor((block.y - radius) / spatialCellSize);
+    const maxY = Math.floor((block.y + radius) / spatialCellSize);
+    for (let cellX = minX; cellX <= maxX; cellX++) {
+      for (let cellY = minY; cellY <= maxY; cellY++) {
+        const key = `${cellX}:${cellY}`;
+        const bucket = next.get(key) || [];
+        bucket.push(block);
+        next.set(key, bucket);
+      }
+    }
+  }
+  blockSpatialIndex = next;
+}
+
+function nearbyBlocks(x, y, radius) {
+  if (!blockSpatialIndex.size) return blocks;
+  const found = new Set();
+  const minX = Math.floor((x - radius) / spatialCellSize);
+  const maxX = Math.floor((x + radius) / spatialCellSize);
+  const minY = Math.floor((y - radius) / spatialCellSize);
+  const maxY = Math.floor((y + radius) / spatialCellSize);
+  for (let cellX = minX; cellX <= maxX; cellX++) {
+    for (let cellY = minY; cellY <= maxY; cellY++) {
+      for (const block of blockSpatialIndex.get(`${cellX}:${cellY}`) || []) found.add(block);
+    }
+  }
+  return found;
 }
 
 function isBossShieldRole(role) {
@@ -666,7 +720,7 @@ function startGame() {
   pendingComboPraise = null;
   comboPraiseToast = null;
   resetUpgrades();
-  balls = []; particles = []; popups = []; banners = []; trails = []; shockwaves = []; beams = []; dropping = false; openingDrop = false;
+  balls = []; particles = []; popups = []; banners = []; trails = []; shockwaves = []; beams = []; aimGuideCache = null; dropping = false; openingDrop = false;
   seedBlocks();
   running = true;
   startOpeningDrop();
@@ -826,6 +880,7 @@ function activateGoldenMissiles() {
 function spawnBall() {
   if (!running || !aiming || dropping || choosingBuff) return;
   aiming = false;
+  aimGuideCache = null;
   chain = 1; shotHits = 0; praisedComboTier = 0; pendingComboPraise = null; comboPraiseToast = null;
   const golden = goldenShots > 0;
   const plan = launchPlan(golden);
@@ -839,7 +894,9 @@ function spawnBall() {
 }
 
 function burst(x, y, color, amount = 12) {
-  for (let i = 0; i < amount; i++) {
+  const available = Math.max(0, maxParticles - particles.length);
+  const budget = Math.min(amount, available);
+  for (let i = 0; i < budget; i++) {
     const a = random(0, Math.PI * 2), speed = random(55, 220);
     const life = random(.24, .58);
     particles.push({
@@ -1082,7 +1139,7 @@ function addDefenseCharge(amount = 1) {
   if (defenseLayers >= DEFENSE_MAX_LAYERS) defenseCharge = 0;
 }
 
-function triggerDefenseLine() {
+function triggerDefenseLine(emergency = false) {
   if (defenseLayers <= 0 || defenseBlast) return false;
   const layers = clamp(Math.floor(defenseLayers), 1, DEFENSE_MAX_LAYERS);
   defenseReady = false;
@@ -1092,7 +1149,7 @@ function triggerDefenseLine() {
   shake = Math.max(shake, 12 + layers * 3);
   const y = defenseLineY();
   const layerHeight = defenseLayerHeight();
-  defenseBlast = { layers, index: 0, timer: 0, y, layerHeight, cleared: 0 };
+  defenseBlast = { layers, index: 0, timer: 0, y, layerHeight, cleared: 0, emergency };
   showBanner("GEM GUARD", `x${layers} LAYER CHAIN`, "#5bbcff", 1.35);
   popups.push({ x: w / 2, y: y - layers * layerHeight - 18, text: `GEM GUARD x${layers}!`, life: 1.35 });
   playSound("chain", 9 + layers);
@@ -1114,7 +1171,9 @@ function resolveDefenseBlastLayer() {
   for (const block of blocks) {
     if (block.value <= 0) continue;
     const blockY = block.targetY ?? block.y;
-    if (blockY + blockLayoutRadius(block) < layerTop || blockY - blockLayoutRadius(block) > layerBottom) continue;
+    const inLayer = blockY + blockLayoutRadius(block) >= layerTop && blockY - blockLayoutRadius(block) <= layerBottom;
+    const crossesFailureLine = defenseBlast.emergency && blockY + blockLayoutRadius(block) >= launchY - 56;
+    if (!inLayer && !crossesFailureLine) continue;
     block.value = 0;
     block.pulse = 1;
     cleared += 1;
@@ -1222,15 +1281,23 @@ function hitBlock(block, ball) {
 }
 
 function addRow() {
+  aimGuideCache = null;
   turn += 1;
   dropping = true;
   const dropBonus = dropGrowthBonus(turn);
   const dropDistance = rowDropDistance(turn);
   blocks.forEach(block => block.targetY += dropDistance);
-  if (defenseLayers > 0 && blocks.some(block => block.targetY + blockLayoutRadius(block) > defenseLineY())) {
+  const reachesFailureLine = () => blocks.some(block => block.value > 0 && block.targetY > launchY - 52);
+  if (reachesFailureLine() && (defenseLayers > 0 || defenseBlast)) {
+    if (defenseLayers > 0) triggerDefenseLine(true);
+    if (defenseBlast) {
+      defenseBlast.emergency = true;
+      resolveDefenseBlastLayer();
+    }
+  } else if (defenseLayers > 0 && blocks.some(block => block.targetY + blockLayoutRadius(block) > defenseLineY())) {
     triggerDefenseLine();
   }
-  if (blocks.some(block => block.value > 0 && block.targetY > launchY - 52)) {
+  if (reachesFailureLine()) {
     endGame();
     return;
   }
@@ -1470,7 +1537,7 @@ function aimGuidePoints(shot, length, predictive) {
       cooldown = 20;
     }
     if (cooldown <= 0) {
-      for (const block of blocks) {
+      for (const block of nearbyBlocks(probe.x, probe.y, 42)) {
         const currentValue = previewHealth.get(block) ?? block.value;
         if (currentValue <= 0) continue;
         const collision = ballBlockCollision(probe, block);
@@ -1487,9 +1554,26 @@ function aimGuidePoints(shot, length, predictive) {
   return points;
 }
 
+function cachedAimGuidePoints(shot, length, index) {
+  const key = [
+    index,
+    shot.angle.toFixed(4),
+    shot.golden,
+    shot.radius,
+    shot.speed,
+    length,
+    blocks.length,
+    turn
+  ].join("|");
+  const cache = aimGuideCache ?? new Map();
+  aimGuideCache = cache;
+  if (!cache.has(key)) cache.set(key, aimGuidePoints(shot, length, true));
+  return cache.get(key);
+}
+
 function iceFieldInfo(ball) {
   let weight = 0, cx = 0, cy = 0, bottom = 0, nearest = Infinity;
-  for (const block of blocks) {
+  for (const block of nearbyBlocks(ball.x, ball.y, 160)) {
     if (block.value <= 0) continue;
     const dx = block.x - ball.x;
     const dy = block.y - ball.y;
@@ -1574,7 +1658,7 @@ function step(dt) {
       block.y = block.targetY;
     }
   });
-  if (dropping && !openingDrop) separateBlocks(blocks, 2);
+  if (dropping && !openingDrop) separateBlocks(blocks, isMobile ? 1 : 2);
   if (dropping && blocks.every(block => Math.abs(block.y - block.targetY) <= settleDistance)) {
     blocks.forEach(block => { block.y = block.targetY; });
     dropping = false;
@@ -1583,6 +1667,7 @@ function step(dt) {
     hint.textContent = choosingBuff ? "能量已满 · 选择一个强化" : "左右拖动调整角度 · 点击发射";
   }
 
+  rebuildBlockSpatialIndex();
   for (const ball of balls) {
     if (!ball.alive) continue;
     const substeps = 4;
@@ -1598,7 +1683,7 @@ function step(dt) {
         ball.vy = Math.abs(ball.vy);
         ball.y = ball.r + 84;
       }
-      for (const block of blocks) {
+      for (const block of nearbyBlocks(ball.x, ball.y, 48)) {
         if (block.value <= 0 || block.hit > 0) continue;
         const collision = ballBlockCollision(ball, block);
         if (collision) {
@@ -1612,7 +1697,11 @@ function step(dt) {
       guideBallInsideIce(ball, dt / substeps);
     }
     if (ball.y > h + 20) ball.alive = false;
-    trails.push({ x: ball.x, y: ball.y, life: .18, golden: ball.golden });
+    ball.trailTimer = (ball.trailTimer || 0) - dt;
+    if (ball.trailTimer <= 0 && trails.length < maxTrails) {
+      trails.push({ x: ball.x, y: ball.y, life: .18, golden: ball.golden });
+      ball.trailTimer = isMobile ? .035 : .02;
+    }
   }
   blocks.forEach(block => block.hit = Math.max(0, block.hit - dt));
   if (BOSS_ENABLED) {
@@ -1693,6 +1782,32 @@ function traceIceShape(block, radius, offsetX = 0, offsetY = 0) {
   ctx.restore();
 }
 
+function drawSimpleGem(block, radius) {
+  const color = blockColor(block);
+  const palette = icePalette(block);
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 9 + block.pulse * 10;
+  const face = ctx.createLinearGradient(block.x - radius, block.y - radius, block.x + radius, block.y + radius);
+  face.addColorStop(0, palette[0]);
+  face.addColorStop(.55, palette[1]);
+  face.addColorStop(1, palette[2]);
+  ctx.fillStyle = face;
+  traceIceShape(block, radius);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = palette[3];
+  ctx.lineWidth = 1.7;
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,.48)";
+  ctx.lineWidth = .8;
+  ctx.beginPath();
+  ctx.moveTo(block.x - radius * .58, block.y - radius * .42);
+  ctx.lineTo(block.x + radius * .48, block.y + radius * .18);
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawIceBlock(block, radius) {
   const color = blockColor(block);
   const damage = 1 - block.value / block.max;
@@ -1700,8 +1815,9 @@ function drawIceBlock(block, radius) {
   ctx.save();
 
   // Neon gem style: dark glass thickness below, bright refractive face on top.
-  for (let depth = 10; depth >= 1; depth--) {
-    const ratio = depth / 10;
+  const depthLayers = renderQuality === "mobile" ? 4 : 10;
+  for (let depth = depthLayers; depth >= 1; depth--) {
+    const ratio = depth / depthLayers;
     ctx.fillStyle = `rgba(8, 17, 38, ${.18 + ratio * (.18 + toughness * .1)})`;
     traceIceShape(block, radius, depth * (.75 + toughness * .16), depth * (1.05 + toughness * .22));
     ctx.fill();
@@ -1794,17 +1910,19 @@ function drawIceBlock(block, radius) {
   ctx.lineTo(block.x + radius * .74, block.y + radius * .48);
   ctx.stroke();
 
-  ctx.globalCompositeOperation = "screen";
-  ctx.strokeStyle = "rgba(255,255,255,.26)";
-  ctx.lineWidth = .75;
-  for (let i = 0; i < 3; i++) {
-    const offset = (i - 1) * radius * .24;
-    ctx.beginPath();
-    ctx.moveTo(block.x - radius * .86, block.y + offset);
-    ctx.quadraticCurveTo(block.x - radius * .05, block.y - radius * .34 + offset * .2, block.x + radius * .78, block.y + offset * .42);
-    ctx.stroke();
+  if (renderQuality === "desktop") {
+    ctx.globalCompositeOperation = "screen";
+    ctx.strokeStyle = "rgba(255,255,255,.26)";
+    ctx.lineWidth = .75;
+    for (let i = 0; i < 3; i++) {
+      const offset = (i - 1) * radius * .24;
+      ctx.beginPath();
+      ctx.moveTo(block.x - radius * .86, block.y + offset);
+      ctx.quadraticCurveTo(block.x - radius * .05, block.y - radius * .34 + offset * .2, block.x + radius * .78, block.y + offset * .42);
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = "source-over";
   }
-  ctx.globalCompositeOperation = "source-over";
 
   ctx.shadowColor = color;
   ctx.shadowBlur = 12;
@@ -2167,6 +2285,7 @@ function draw() {
   for (const block of blocks) {
     const radius = blockRadius(block) + block.pulse * 4;
     if (block.special === "mystery") drawMysteryGift(block, radius);
+    else if (isMobile && blocks.length > 28) drawSimpleGem(block, radius);
     else drawIceBlock(block, radius);
     ctx.font = "900 13px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     ctx.lineWidth = 3;
@@ -2439,8 +2558,9 @@ function draw() {
     const baseLength = 276;
     const length = adAimBoost ? baseLength * 2 : baseLength * Math.min(2, 1 + upgrades.aim * .25);
     const plan = launchPlan(goldenShots > 0);
-    for (const shot of plan) {
-      const points = aimGuidePoints(shot, length, true);
+    for (let index = 0; index < plan.length; index++) {
+      const shot = plan[index];
+      const points = cachedAimGuidePoints(shot, length, index);
       for (const point of points) {
         const progress = point.distance / length;
         const radius = 3.7 - progress * 2.35;
@@ -2481,15 +2601,19 @@ function loop(ts) {
   const dt = Math.min(.03, (ts - (last || ts)) / 1000);
   last = ts;
   if (running) step(dt);
-  draw();
+  if (!targetRenderInterval || ts - lastRender >= targetRenderInterval) {
+    draw();
+    lastRender = ts;
+  }
   raf = platform.frame(loop);
 }
 
 function setAim(clientX) {
   const rect = canvas.getBoundingClientRect();
   const ratio = clamp((clientX - rect.left) / rect.width, 0, 1);
-  angle = -Math.PI + ratio * Math.PI;
-  angle = clamp(angle, -Math.PI + .2, -.2);
+  const nextAngle = clamp(-Math.PI + ratio * Math.PI, -Math.PI + .2, -.2);
+  if (Math.abs(nextAngle - angle) > .0005) aimGuideCache = null;
+  angle = nextAngle;
 }
 
 canvas.addEventListener("pointerdown", e => { dragging = true; setAim(e.clientX); });
