@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>宝石弹射</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <canvas id="game" aria-label="宝石弹射游戏区域"></canvas>
+      <header class="hud">
+        <div>
+          <span class="eyebrow">SCORE</span>
+          <strong id="score">000000</strong>
+        </div>
+        <div class="level">
+          <span class="eyebrow">CHAIN</span>
+          <strong id="chain">x1</strong>
+        </div>
+        <button id="soundBtn" class="sound" type="button" aria-label="关闭音效">音效 ON</button>
+      </header>
+      <section class="heat">
+        <div><span>GEM CHARGE</span><strong id="stormText">0%</strong></div>
+        <i><b id="heatFill"></b></i>
+      </section>
+      <section class="buff-bar" id="buffBar" aria-label="当前强化"></section>
+      <section class="start-card" id="startCard">
+        <p class="tag">AIM · SHOOT · SMASH</p>
+        <h1>宝石弹射</h1>
+        <p>左右拖动调整角度<br />点击发射，连续反弹砸碎宝石</p>
+        <button id="startBtn" type="button">开始弹射</button>
+        <div class="leaderboard" id="startLeaderboard"></div>
+      </section>
+      <section class="game-over hidden" id="gameOver">
+        <p class="tag">RUN OVER</p>
+        <h2>撞线了</h2>
+        <p id="finalScore"></p>
+        <div class="leaderboard" id="gameOverLeaderboard"></div>
+        <button id="restartBtn" type="button">再来一局</button>
+      </section>
+      <section class="upgrade-card hidden" id="upgradeCard">
+        <p class="tag">BUFF READY</p>
+        <h2>选择强化</h2>
+        <div class="upgrade-list" id="upgradeList"></div>
+      </section>
+      <button id="rankBtn" class="rank-button" type="button" aria-label="查看本机排名">排名</button>
+      <section class="rank-panel hidden" id="rankPanel" aria-label="本机排行榜">
+        <div class="rank-panel-head"><strong>LOCAL RANK</strong><button id="rankCloseBtn" type="button" aria-label="关闭排行榜">×</button></div>
+        <div class="leaderboard" id="rankLeaderboard"></div>
+      </section>
+      <button id="adAimBtn" class="ad-aim" type="button">看广告<br /><span>延长线</span></button>
+      <div class="guard-test" hidden>
+        <input id="guardLayerInput" type="number" min="1" max="5" value="3" aria-label="保护层测试层数" />
+        <button id="guardTestBtn" type="button">测试保护层</button>
+        <button id="xpTestBtn" type="button">XP测试</button>
+        <button id="limitIceBtn" type="button">极限宝石</button>
+      </div>
+      <div class="hint" id="hint">左右拖动调整角度 · 点击发射</div>
+    </main>
+    <script src="platform.js"></script>
+    <script src="game.js"></script>
+  </body>
+</html>
